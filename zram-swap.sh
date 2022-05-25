@@ -16,8 +16,10 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 _zram_fraction="1/2"
 _zram_algorithm="lz4"
 _comp_factor=''
-_zram_fixedsize=''
+_zram_fixed_size=''
 _zram_swap_debug=''
+_zram_backing_dev=''
+_zram_max_memory=''
 
 # load user config
 [ -f /etc/default/zram-swap ] &&
@@ -78,40 +80,73 @@ _main() {
 
 # initialize swap
 _init() {
-  if [ -n "$_zram_fixedsize" ]; then
-    if ! _regex_match "$_zram_fixedsize" '^[[:digit:]]+(\.[[:digit:]]+)?(G|M)$'; then
-      err "init: Invalid size '$_zram_fixedsize'. Format sizes like: 100M 250M 1.5G 2G etc."
+  _total_mem=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+  
+  # calculate zram size
+  if [ -n "$_zram_fixed_size" ]; then
+    # check for valid size
+    if ! _regex_match "$_zram_fixed_size" '^[[:digit:]]+(\.[[:digit:]]+)?(G|M)$'; then
+      err "init: Invalid size '$_zram_fixed_size'. Format sizes like: 100M 250M 1.5G 2G etc."
       exit 1
     fi
     # Use user supplied zram size
-    mem="$_zram_fixedsize"
+    _zram_size="$_zram_fixed_size"
   else
-    # Calculate memory to use for zram
-    totalmem=$(awk '/MemTotal/{print $2}' /proc/meminfo)
-    mem=$(calc "$totalmem * $_comp_factor * $_zram_fraction * 1024")
+    # Calculate zram size to use for zram
+    _zram_size=$(calc "$_total_mem * $_comp_factor * $_zram_fraction * 1024")
+  fi
+  
+  # calculate zram max memory
+  if [ -n "$_zram_max_memory" ]; then
+    # Auto: calculate max memory to use for zram
+    if [ "$_zram_max_memory" = "auto" ]; then
+      _zram_memory=$(calc "$_total_mem * $_zram_fraction * 1024")
+    fi
+    # check for valid size
+    if ! _regex_match "$_zram_max_memory" '^[[:digit:]]+(\.[[:digit:]]+)?(G|M)$'; then
+      err "init: Invalid size '$_zram_max_memory'. Format sizes like: 100M 250M 1.5G 2G etc."
+      exit 1
+    fi
+    # Use user supplied zram max memory
+    _zram_memory="$_zram_max_memory"
   fi
 
-  # NOTE: zramctl sometimes fails if we don't wait for the module to settle after loading
-  #       we'll retry a couple of times with slightly increasing delays before giving up
-  _device=''
-  for i in $(seq 3); do
-    # sleep for "0.1 * $i" seconds rounded to 2 digits
-    sleep "$(calc 2 "0.1 * $i")"
-    _device=$(zramctl -f -s "$mem" -a "$_zram_algorithm") || true
-    [ -b "$_device" ] && break
-  done
-
-  if [ -b "$_device" ]; then
-    # cleanup the device if swap setup fails
-    trap "_rem_zdev $_device" EXIT
-    mkswap "$_device"
-    swapon -d -p 15 "$_device"
-    trap - EXIT
-    return 0
-  else
+  # create zram device
+  _device_id="$(cat /sys/class/zram-control/hot_add)"
+  _device="/dev/zram$_device_id"
+  if [ ! -b "$_device" ]; then
     err "init: Failed to initialize zram device"
     return 1
   fi
+
+  # cleanup the device if swap setup fails
+  trap "_rem_zdev $_device $_device_id" EXIT
+  # REGION
+    
+  # set backing device
+  if [ -b "$_zram_backing_dev" ]; then
+    echo "$_zram_backing_dev" > "/sys/block/zram$_device_id/backing_dev"
+  fi
+  # set zram max memory
+  if [ -n "$_zram_memory" ]; then
+    echo "$_zram_memory" > "/sys/block/zram$_device_id/mem_limit"
+  fi
+  # set zram compress algorithm and disk size
+  echo "$_zram_algorithm" > "/sys/block/zram$_device_id/comp_algorithm"
+  echo "$_zram_size" > "/sys/block/zram$_device_id/disksize"
+  # set writeback condition.
+  if [ -b "$_zram_backing_dev" ]; then
+    # TODO: configurable writeback condition
+    # https://www.kernel.org/doc/html/v5.18/admin-guide/blockdev/zram.html
+    echo "huge" > "/sys/block/zram$_device_id/writeback"
+  fi
+  # create swap and enable
+  mkswap "$_device"
+  swapon -d -p 15 "$_device"
+    
+  # ENDREGION
+  trap - EXIT
+  return 0
 }
 
 # end swapping and cleanup
@@ -129,17 +164,19 @@ _end() {
 
 # Remove zram device with retry
 _rem_zdev() {
-  if [ ! -b "$1" ]; then
+  _device="$1"
+  _device_id="$2"
+  if [ ! -b "$_device" ]; then
     err "rem_zdev: No zram device '$1' to remove"
     return 1
   fi
   for i in $(seq 3); do
     # sleep for "0.1 * $i" seconds rounded to 2 digits
     sleep "$(calc 2 "0.1 * $i")"
-    zramctl -r "$1" || true
-    [ -b "$1" ] || break
+    echo "$_device_id" > "/sys/class/zram-control/hot_remove"
+    [ -b "$_device" ] || break
   done
-  if [ -b "$1" ]; then
+  if [ -b "$_device" ]; then
     err "rem_zdev: Couldn't remove zram device '$1' after 3 attempts"
     return 1
   fi
